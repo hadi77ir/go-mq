@@ -3,7 +3,7 @@ module github.com/hadi77ir/go-mq/rabbitmq
 go 1.24.0
 
 require (
-	github.com/hadi77ir/go-mq v1.0.0
+	github.com/hadi77ir/go-mq v1.1.0
 	github.com/rabbitmq/amqp091-go v1.9.0
 	github.com/testcontainers/testcontainers-go v0.39.0
 )
