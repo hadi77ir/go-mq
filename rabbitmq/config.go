@@ -6,6 +6,20 @@ import (
 	"github.com/hadi77ir/go-mq"
 )
 
+// PublishMode controls how messages are published/consumed.
+type PublishMode int
+
+const (
+	// PublishModePubSub uses fanout exchange with temporary queues (non-persistent pub-sub).
+	PublishModePubSub PublishMode = iota + 1
+	// PublishModePersistentPubSub uses fanout exchange with durable queues (persistent pub-sub).
+	PublishModePersistentPubSub
+	// PublishModePushPull uses queues for work distribution (non-persistent push-pull).
+	PublishModePushPull
+	// PublishModePersistentPushPull uses durable queues for work distribution (persistent push-pull).
+	PublishModePersistentPushPull
+)
+
 // Config captures RabbitMQ specific settings alongside the shared mq.Config.
 type Config struct {
 	Connection mq.Config
@@ -29,10 +43,15 @@ type Config struct {
 	Prefetch int
 
 	// QueueDurable indicates if queues created via CreateQueue should be durable.
+	// This is overridden by PublishMode for Consume operations.
 	QueueDurable bool
 
 	// IdleTimeout is applied to pooled connections.
 	IdleTimeout time.Duration
+
+	// PublishMode selects the messaging model (pub-sub vs push-pull, persistent vs non-persistent).
+	// Defaults to PublishModePersistentPushPull if not set.
+	PublishMode PublishMode
 }
 
 func (c Config) normalized() Config {
@@ -42,8 +61,17 @@ func (c Config) normalized() Config {
 	if c.DialTimeout == 0 {
 		c.DialTimeout = 5 * time.Second
 	}
+	// Default to persistent push-pull if not set (zero value)
+	if c.PublishMode == 0 {
+		c.PublishMode = PublishModePersistentPushPull
+	}
 	if c.ExchangeType == "" {
-		c.ExchangeType = "direct"
+		// Default to fanout for pub-sub modes, direct for push-pull modes
+		if c.PublishMode == PublishModePubSub || c.PublishMode == PublishModePersistentPubSub {
+			c.ExchangeType = "fanout"
+		} else {
+			c.ExchangeType = "direct"
+		}
 	}
 	if c.IdleTimeout == 0 {
 		c.IdleTimeout = time.Minute

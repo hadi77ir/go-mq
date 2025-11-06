@@ -154,5 +154,6 @@ type Broker interface {
 	Consume(ctx context.Context, topic string, queue string, consumerName string, opts ...Option) (Consumer, error)
 	CreateQueue(ctx context.Context, topic string, queue string) error
 	DeleteQueue(ctx context.Context, topic string, queue string) error
+	Flush(ctx context.Context) error // Flush ensures all pending operations are completed
 	Close(ctx context.Context) error
 }

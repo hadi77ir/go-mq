@@ -352,6 +352,21 @@ func (b *Broker) DeleteQueue(ctx context.Context, topic, queue string) error {
 	return nil
 }
 
+// Flush ensures all pending operations are completed by flushing the connection.
+func (b *Broker) Flush(ctx context.Context) error {
+	wrapper, err := b.pool.Get(ctx)
+	if err != nil {
+		return errors.Join(mq.ErrNoConnection, err)
+	}
+	defer b.pool.Release(wrapper) // nolint:errcheck
+
+	// Flush the NATS connection to ensure all pending operations are sent
+	if err := wrapper.Conn.Flush(); err != nil {
+		return errors.Join(mq.ErrNoConnection, err)
+	}
+	return nil
+}
+
 // Close releases the pool.
 func (b *Broker) Close(ctx context.Context) error {
 	if err := b.pool.Close(); err != nil {

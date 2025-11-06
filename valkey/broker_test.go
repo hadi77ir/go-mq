@@ -325,7 +325,7 @@ func TestConsistencyAutoAck(t *testing.T) {
 	}
 	defer broker.Close(context.Background()) // nolint:errcheck
 
-	stream := "autoadk-test"
+	stream := "autoack-test"
 	group := "test-group"
 
 	if err := broker.CreateQueue(ctx, stream, group); err != nil {

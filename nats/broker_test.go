@@ -214,7 +214,7 @@ func TestConsistencyAutoAck(t *testing.T) {
 			Addresses: []string{fmt.Sprintf("%s:%s", host, port)},
 		},
 		PublishMode:   PublishModeJetStream,
-		StreamName:    "autoadk",
+		StreamName:    "autoack",
 		SubjectPrefix: "test",
 		PullBatch:     1,
 	}
@@ -225,18 +225,18 @@ func TestConsistencyAutoAck(t *testing.T) {
 	}
 	defer broker.Close(context.Background()) // nolint:errcheck
 
-	if err := broker.CreateQueue(ctx, "autoadk", "workers"); err != nil {
+	if err := broker.CreateQueue(ctx, "autoack", "workers"); err != nil {
 		t.Fatalf("CreateQueue: %v", err)
 	}
 
 	// Test AutoAck=true
-	consumer, err := broker.Consume(ctx, "autoadk", "workers", "", mq.WithAutoAck(true))
+	consumer, err := broker.Consume(ctx, "autoack", "workers", "", mq.WithAutoAck(true))
 	if err != nil {
 		t.Fatalf("Consume: %v", err)
 	}
 	defer consumer.Close() // nolint:errcheck
 
-	if err := broker.Publish(ctx, "autoadk", mq.Message{Body: []byte("test1")}); err != nil {
+	if err := broker.Publish(ctx, "autoack", mq.Message{Body: []byte("test1")}); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 
@@ -251,7 +251,7 @@ func TestConsistencyAutoAck(t *testing.T) {
 	}
 
 	// With AutoAck, message should already be acked
-	if err := broker.Publish(ctx, "autoadk", mq.Message{Body: []byte("test2")}); err != nil {
+	if err := broker.Publish(ctx, "autoack", mq.Message{Body: []byte("test2")}); err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 

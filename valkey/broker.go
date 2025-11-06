@@ -259,6 +259,22 @@ func (b *Broker) DeleteQueue(ctx context.Context, topic, queue string) error {
 	return nil
 }
 
+// Flush ensures all pending operations are completed.
+// For Valkey, this is a no-op as operations are synchronous, but we verify connection health.
+func (b *Broker) Flush(ctx context.Context) error {
+	client, err := b.pool.Get(ctx)
+	if err != nil {
+		return errors.Join(mq.ErrNoConnection, err)
+	}
+	defer b.pool.Release(client) // nolint:errcheck
+
+	// Verify connection by doing a simple PING
+	if err := client.Client.Do(ctx, client.Client.B().Ping().Build()).Error(); err != nil {
+		return errors.Join(mq.ErrNoConnection, err)
+	}
+	return nil
+}
+
 // Close releases pooled clients.
 func (b *Broker) Close(ctx context.Context) error {
 	if err := b.pool.Close(); err != nil {

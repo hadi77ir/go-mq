@@ -180,7 +180,14 @@ func (b *Broker) Publish(ctx context.Context, routingKey string, msg mq.Message,
 		publishing.Headers[k] = v
 	}
 
-	if persistent {
+	// Set persistence based on PublishMode or explicit PersistentOption
+	shouldBePersistent := persistent
+	if !shouldBePersistent {
+		// Check if mode requires persistence
+		shouldBePersistent = b.cfg.PublishMode == PublishModePersistentPubSub ||
+			b.cfg.PublishMode == PublishModePersistentPushPull
+	}
+	if shouldBePersistent {
 		publishing.DeliveryMode = amqp.Persistent
 	}
 	if expiration > 0 {
@@ -253,9 +260,18 @@ func (b *Broker) Consume(ctx context.Context, topic string, queue string, consum
 		}
 	}
 
+	// Determine queue properties based on PublishMode
+	isPubSub := b.cfg.PublishMode == PublishModePubSub || b.cfg.PublishMode == PublishModePersistentPubSub
+	isPersistent := b.cfg.PublishMode == PublishModePersistentPubSub || b.cfg.PublishMode == PublishModePersistentPushPull
+
 	queueName := queue
 	if queueName == "" {
-		queueName = topic
+		if isPubSub {
+			// For pub-sub, generate a unique queue name per consumer
+			queueName = fmt.Sprintf("pubsub-%s-%d", topic, time.Now().UnixNano())
+		} else {
+			queueName = topic
+		}
 	}
 	if queueName == "" {
 		ch.Close()           // nolint:errcheck
@@ -268,11 +284,17 @@ func (b *Broker) Consume(ctx context.Context, topic string, queue string, consum
 		queueArgs["x-dead-letter-exchange"] = deadLetterTopic
 	}
 
+	// For pub-sub modes: auto-delete queues (temporary for non-persistent, durable for persistent)
+	// For push-pull modes: regular queues with durability based on mode
+	queueDurable := isPersistent
+	queueAutoDelete := isPubSub && !isPersistent
+	queueExclusive := isPubSub && !isPersistent
+
 	_, err = ch.QueueDeclare(
 		queueName,
-		b.cfg.QueueDurable,
-		false,
-		false,
+		queueDurable,
+		queueAutoDelete,
+		queueExclusive,
 		false,
 		queueArgs,
 	)
@@ -282,8 +304,14 @@ func (b *Broker) Consume(ctx context.Context, topic string, queue string, consum
 		return nil, errors.Join(mq.ErrConsumeFailed, err)
 	}
 
-	if b.cfg.Exchange != "" && topic != "" {
-		if err := ch.QueueBind(queueName, topic, b.cfg.Exchange, false, nil); err != nil {
+	// For pub-sub modes with fanout exchange, routing key is ignored
+	// For push-pull modes, bind with the topic as routing key
+	if b.cfg.Exchange != "" {
+		routingKey := topic
+		if isPubSub && b.cfg.ExchangeType == "fanout" {
+			routingKey = "" // Fanout exchanges ignore routing keys
+		}
+		if err := ch.QueueBind(queueName, routingKey, b.cfg.Exchange, false, nil); err != nil {
 			ch.Close()           // nolint:errcheck
 			b.pool.Release(conn) // nolint:errcheck
 			return nil, errors.Join(mq.ErrConsumeFailed, err)
@@ -327,9 +355,21 @@ func (b *Broker) CreateQueue(ctx context.Context, topic, queue string) error {
 	}
 	defer ch.Close() // nolint:errcheck
 
+	if b.cfg.PublishMode == PublishModePubSub {
+		return errors.Join(mq.ErrNotSupported, fmt.Errorf("rabbitmq: CreateQueue not supported in non-persistent pub-sub mode"))
+	}
+
+	// Determine queue properties based on PublishMode
+	isPersistent := b.cfg.PublishMode == PublishModePersistentPubSub || b.cfg.PublishMode == PublishModePersistentPushPull
+	queueDurable := isPersistent
+	if b.cfg.QueueDurable {
+		// Explicit QueueDurable config overrides PublishMode
+		queueDurable = true
+	}
+
 	_, err = ch.QueueDeclare(
 		queue,
-		b.cfg.QueueDurable,
+		queueDurable,
 		false,
 		false,
 		false,
@@ -340,7 +380,12 @@ func (b *Broker) CreateQueue(ctx context.Context, topic, queue string) error {
 	}
 
 	if b.cfg.Exchange != "" && topic != "" {
-		if err := ch.QueueBind(queue, topic, b.cfg.Exchange, false, nil); err != nil {
+		routingKey := topic
+		isPubSub := b.cfg.PublishMode == PublishModePubSub || b.cfg.PublishMode == PublishModePersistentPubSub
+		if isPubSub && b.cfg.ExchangeType == "fanout" {
+			routingKey = "" // Fanout exchanges ignore routing keys
+		}
+		if err := ch.QueueBind(queue, routingKey, b.cfg.Exchange, false, nil); err != nil {
 			return errors.Join(mq.ErrConfiguration, err)
 		}
 	}
@@ -364,6 +409,34 @@ func (b *Broker) DeleteQueue(ctx context.Context, _, queue string) error {
 
 	if _, err := ch.QueueDelete(queue, false, false, false); err != nil {
 		return errors.Join(mq.ErrConfiguration, err)
+	}
+	return nil
+}
+
+// Flush ensures all pending operations are completed by flushing the connection pool.
+func (b *Broker) Flush(ctx context.Context) error {
+	conn, err := b.pool.Get(ctx)
+	if err != nil {
+		return errors.Join(mq.ErrNoConnection, err)
+	}
+	defer b.pool.Release(conn) // nolint:errcheck
+
+	ch, err := conn.Channel()
+	if err != nil {
+		return errors.Join(mq.ErrNoConnection, err)
+	}
+	defer ch.Close() // nolint:errcheck
+
+	// AMQP channels don't have a direct flush, but we can ensure the channel is ready
+	// by checking if we can declare a temporary queue and delete it
+	tempQueue := fmt.Sprintf("__flush__%d", time.Now().UnixNano())
+	_, err = ch.QueueDeclare(tempQueue, false, true, true, false, nil)
+	if err != nil {
+		return errors.Join(mq.ErrNoConnection, err)
+	}
+	_, err = ch.QueueDelete(tempQueue, false, false, false)
+	if err != nil {
+		return errors.Join(mq.ErrNoConnection, err)
 	}
 	return nil
 }
