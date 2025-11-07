@@ -15,8 +15,22 @@ type Config struct {
     Prefetch          int           // QoS prefetch when consuming
     QueueDurable      bool          // declare durable queues
     IdleTimeout       time.Duration // idle connection eviction window
+    PublishMode       PublishMode   // Push/Pull, Pub/Sub, or Streams (defaults to persistent push-pull)
+    Stream            StreamConfig  // retention controls when PublishModeStreams is selected
+}
+
+type StreamConfig struct {
+    Addresses            []string      // override stream endpoints (defaults to Connection.Addresses)
+    Partitions           int           // number of partitions per super stream
+    MaxLengthBytes       int64         // x-max-length-bytes
+    MaxSegmentSizeBytes  int64         // x-stream-max-segment-size-bytes
+    MaxAge               time.Duration // x-max-age
+    MaxProducersPerClient int          // stream client pooling for producers
+    MaxConsumersPerClient int          // stream client pooling for consumers
 }
 ```
+
+> **Note**: RabbitMQ Streams requires the `rabbitmq_stream` plugin. The integration tests automatically enable the plugin by running `rabbitmq-plugins enable --offline rabbitmq_stream` and restarting the container before exercising the adapter. Ensure the plugin is installed and enabled in any non-test environment before selecting `PublishModeStreams`.
 
 The shared `mq.Config` embedded in `Connection` supplies addresses, credentials, and optional TLS information. The adapter dials each address in order until a connection succeeds. TLS can be provided either through `TLSConfig` or the legacy `UseTLS`/certificate path fields.
 
@@ -29,6 +43,28 @@ broker.Publish(ctx, "orders.created", mq.Message{
     Body:        payload,
     ContentType: "application/json",
 }, &mq.PublishOptions{Persistent: true})
+```
+
+Publish modes control how queues are declared and how persistence is handled:
+
+- `PublishModePushPull` (default) – competing consumers with transient queues.
+- `PublishModePersistentPushPull` – push/pull with durable queues and persistent messages.
+- `PublishModePubSub` / `PublishModePersistentPubSub` – fan-out semantics where each consumer receives a copy.
+- `PublishModeStreams` – RabbitMQ stream queues backed by the streams feature, providing log-style retention similar to Valkey streams. `StreamConfig` exposes retention knobs such as `MaxLengthBytes`, `MaxSegmentSizeBytes`, and `MaxAge`.
+
+```go
+cfg := rabbitmq.Config{
+    PublishMode: rabbitmq.PublishModeStreams,
+    Stream: rabbitmq.StreamConfig{
+        Addresses:            []string{"rabbitmq-stream://guest:guest@localhost:5552/"},
+        Partitions:           5,
+        MaxLengthBytes:      256 << 20, // 256 MiB retention
+        MaxSegmentSizeBytes: 8 << 20,   // 8 MiB segments
+        MaxAge:              24 * time.Hour,
+        MaxProducersPerClient: 5,
+        MaxConsumersPerClient: 5,
+    },
+}
 ```
 
 ## Consuming
@@ -49,6 +85,8 @@ consumer, _ := broker.Consume(ctx, mq.ConsumeOptions{
     Prefetch: 10,
 })
 ```
+
+When using `PublishModeStreams`, `CreateQueue` declares `x-queue-type=stream` queues and `Consume` sets `x-stream-offset=next`, meaning consumers receive new messages only. The queue behaves like the Valkey streams adapter—multiple consumers on the same queue share work, acknowledged messages stay in the log up to the configured retention limits, and manual acknowledgements advance the shared offset.
 
 ## Queue Management
 

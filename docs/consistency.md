@@ -35,6 +35,7 @@ This document summarizes configuration fields and runtime options that are curre
 * `mq.PublishOptions.Delay` is supported via the `x-delay` header, which requires the RabbitMQ delayed message exchange plugin to be enabled.
 * `mq.ConsumeOptions.StartFromOldest` is respected (queue order is always oldest first in AMQP).
 * `mq.ConsumeOptions.DeadLetterTopic` is translated to `x-dead-letter-exchange` but never validated; if the exchange does not exist the broker will reject messages later.
+* `PublishModeStreams` declares `x-queue-type=stream` queues and applies `StreamConfig` retention arguments while keeping the same competing-consumer semantics as Valkey streams.
 
 ### Valkey (`valkey`)
 

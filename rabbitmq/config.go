@@ -18,7 +18,27 @@ const (
 	PublishModePushPull
 	// PublishModePersistentPushPull uses durable queues for work distribution (persistent push-pull).
 	PublishModePersistentPushPull
+	// PublishModeStreams uses RabbitMQ stream queues to provide log-style semantics similar to Valkey streams.
+	PublishModeStreams
 )
+
+// StreamConfig captures RabbitMQ stream queue specific settings.
+type StreamConfig struct {
+	// Addresses overrides Connection.Addresses for stream connections (host:port or URI).
+	Addresses []string
+	// Partitions controls how many partitions are declared for each super stream.
+	Partitions int
+	// MaxLengthBytes caps the total size retained by the stream (x-max-length-bytes).
+	MaxLengthBytes int64
+	// MaxSegmentSizeBytes controls the size of each stream segment (x-stream-max-segment-size-bytes).
+	MaxSegmentSizeBytes int64
+	// MaxAge bounds how long messages are retained in the stream (x-max-age).
+	MaxAge time.Duration
+	// MaxProducersPerClient configures stream client pooling for producers.
+	MaxProducersPerClient int
+	// MaxConsumersPerClient configures stream client pooling for consumers.
+	MaxConsumersPerClient int
+}
 
 // Config captures RabbitMQ specific settings alongside the shared mq.Config.
 type Config struct {
@@ -52,6 +72,9 @@ type Config struct {
 	// PublishMode selects the messaging model (pub-sub vs push-pull, persistent vs non-persistent).
 	// Defaults to PublishModePersistentPushPull if not set.
 	PublishMode PublishMode
+
+	// Stream configures RabbitMQ stream queues when PublishModeStreams is selected.
+	Stream StreamConfig
 }
 
 func (c Config) normalized() Config {
@@ -75,6 +98,15 @@ func (c Config) normalized() Config {
 	}
 	if c.IdleTimeout == 0 {
 		c.IdleTimeout = time.Minute
+	}
+	if c.Stream.Partitions <= 0 {
+		c.Stream.Partitions = 1
+	}
+	if c.Stream.MaxProducersPerClient <= 0 {
+		c.Stream.MaxProducersPerClient = 1
+	}
+	if c.Stream.MaxConsumersPerClient <= 0 {
+		c.Stream.MaxConsumersPerClient = 1
 	}
 	return c
 }

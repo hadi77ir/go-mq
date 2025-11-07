@@ -166,6 +166,7 @@ func TestConsistencyStartFromOldest(t *testing.T) {
 		// Skip Valkey Streams due to "0-0" limitation with XREADGROUP
 		setupNATS("JetStream", t, "oldest"),
 		setupRabbitMQ("", t, "oldest"),
+		// StartFromOldest not applicable to RabbitMQ Streams (consumer groups track offsets centrally)
 	}
 
 	for _, setup := range setups {
@@ -735,12 +736,7 @@ func TestConsistencyPubSubMultiConsumer(t *testing.T) {
 			}
 
 			// Give consumers time to bind and subscribe
-			// RabbitMQ pub-sub with fanout exchanges needs extra time for queue binding propagation
-			if setup.name == "RabbitMQ" && (setup.mode == "PubSub" || setup.mode == "PersistentPubSub") {
-				time.Sleep(2 * time.Second)
-			} else {
-				time.Sleep(1 * time.Second)
-			}
+			time.Sleep(2 * time.Second)
 
 			// Start receiving from all consumers concurrently before publishing
 			// This ensures all consumers are actively listening when messages arrive
@@ -850,6 +846,7 @@ func getAllBrokerSetups(t *testing.T, testPrefix string) []brokerSetup {
 		setupNATS("Core", t, testPrefix),
 		setupNATS("JetStream", t, testPrefix),
 		setupRabbitMQ("", t, testPrefix),
+		setupRabbitMQ("Streams", t, testPrefix),
 		setupRabbitMQ("PubSub", t, testPrefix),
 		setupRabbitMQ("PersistentPubSub", t, testPrefix),
 		setupRabbitMQ("PushPull", t, testPrefix),
@@ -976,6 +973,13 @@ func setupRabbitMQ(mode string, t *testing.T, testPrefix string) brokerSetup {
 			if err != nil {
 				t.Fatalf("container.MappedPort: %v", err)
 			}
+			var streamPort nat.Port
+			if mode == "Streams" {
+				streamPort, err = container.MappedPort(ctx, "5552/tcp")
+				if err != nil {
+					t.Fatalf("container.MappedPort stream: %v", err)
+				}
+			}
 
 			// Use different exchanges for different modes to avoid conflicts
 			exchangeName := "test.exchange"
@@ -1010,6 +1014,19 @@ func setupRabbitMQ(mode string, t *testing.T, testPrefix string) brokerSetup {
 			case "PersistentPubSub":
 				cfg.PublishMode = mqrabbitmq.PublishModePersistentPubSub
 				cfg.ExchangeType = "fanout"
+			case "Streams":
+				cfg.PublishMode = mqrabbitmq.PublishModeStreams
+				cfg.ExchangeType = "direct"
+				cfg.QueueDurable = true
+				cfg.Stream = mqrabbitmq.StreamConfig{
+					Addresses:             []string{fmt.Sprintf("%s:%s", host, streamPort.Port())},
+					Partitions:            3,
+					MaxLengthBytes:        1 << 22,
+					MaxSegmentSizeBytes:   1 << 20,
+					MaxAge:                10 * time.Minute,
+					MaxProducersPerClient: 5,
+					MaxConsumersPerClient: 5,
+				}
 			case "PushPull":
 				cfg.PublishMode = mqrabbitmq.PublishModePushPull
 				cfg.ExchangeType = "direct"
@@ -1061,14 +1078,31 @@ func startNATS(ctx context.Context) (testcontainers.Container, error) {
 func startRabbitMQ(ctx context.Context) (testcontainers.Container, error) {
 	req := testcontainers.ContainerRequest{
 		Image:        "rabbitmq:3.13-management",
-		ExposedPorts: []string{"5672/tcp"},
+		ExposedPorts: []string{"5672/tcp", "5552/tcp"},
 		WaitingFor:   wait.ForLog("Server startup complete"),
 	}
 
-	return testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+	pluginFile, err := writeStreamPluginFile()
+	if err != nil {
+		return nil, err
+	}
+	req.Files = []testcontainers.ContainerFile{
+		{
+			HostFilePath:      pluginFile,
+			ContainerFilePath: "/etc/rabbitmq/enabled_plugins",
+			FileMode:          0o644,
+		},
+	}
+
+	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: req,
 		Started:          true,
 	})
+	if err != nil {
+		return nil, err
+	}
+
+	return container, nil
 }
 
 func containerAddress(t *testing.T, ctx context.Context, container testcontainers.Container, port string) (string, string) {
@@ -1082,4 +1116,20 @@ func containerAddress(t *testing.T, ctx context.Context, container testcontainer
 		t.Fatalf("container.MappedPort: %v", err)
 	}
 	return host, mapped.Port()
+}
+
+func writeStreamPluginFile() (string, error) {
+	content := `[rabbitmq_federation,rabbitmq_management,rabbitmq_management_agent,rabbitmq_prometheus,rabbitmq_stream,rabbitmq_web_dispatch].` + "\n"
+	tmpFile, err := os.CreateTemp("", "enabled_plugins*.erl")
+	if err != nil {
+		return "", err
+	}
+	if _, err := tmpFile.WriteString(content); err != nil {
+		tmpFile.Close()
+		return "", err
+	}
+	if err := tmpFile.Close(); err != nil {
+		return "", err
+	}
+	return tmpFile.Name(), nil
 }

@@ -3,6 +3,8 @@ package rabbitmq
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"testing"
 	"time"
 
@@ -274,6 +276,122 @@ func TestPublishModePersistentPubSub(t *testing.T) {
 	}
 }
 
+func TestPublishModeStreams(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+
+	container, err := startRabbitMQ(ctx)
+	if err != nil {
+		t.Fatalf("startRabbitMQ: %v", err)
+	}
+	defer func() {
+		_ = container.Terminate(context.Background())
+	}()
+
+	host, err := container.Host(ctx)
+	if err != nil {
+		t.Fatalf("container.Host: %v", err)
+	}
+
+	port, err := container.MappedPort(ctx, "5672/tcp")
+	if err != nil {
+		t.Fatalf("container.MappedPort: %v", err)
+	}
+
+	streamPort, err := container.MappedPort(ctx, "5552/tcp")
+	if err != nil {
+		t.Fatalf("container.MappedPort stream: %v", err)
+	}
+
+	cfg := Config{
+		Connection: mq.Config{
+			Addresses: []string{host + ":" + port.Port()},
+			Username:  "guest",
+			Password:  "guest",
+		},
+		MaxConnections:  3,
+		Exchange:        "streams.exchange",
+		ExchangeType:    "direct",
+		DeclareExchange: true,
+		Prefetch:        5,
+		PublishMode:     PublishModeStreams,
+		Stream: StreamConfig{
+			Addresses:             []string{host + ":" + streamPort.Port()},
+			Partitions:            3,
+			MaxLengthBytes:        1 << 20,
+			MaxAge:                5 * time.Minute,
+			MaxProducersPerClient: 5,
+			MaxConsumersPerClient: 5,
+		},
+	}
+
+	broker, err := NewBroker(ctx, cfg)
+	if err != nil {
+		t.Fatalf("NewBroker: %v", err)
+	}
+	defer broker.Close(context.Background()) // nolint:errcheck
+
+	queue := "streams-queue"
+	if err := broker.CreateQueue(ctx, "streams.route", queue); err != nil {
+		t.Fatalf("CreateQueue: %v", err)
+	}
+
+	consumer1, err := broker.Consume(ctx, "streams.route", queue, "stream-consumer1")
+	if err != nil {
+		t.Fatalf("Consume consumer1: %v", err)
+	}
+	defer consumer1.Close() // nolint:errcheck
+
+	consumer2, err := broker.Consume(ctx, "streams.route", queue, "stream-consumer2")
+	if err != nil {
+		t.Fatalf("Consume consumer2: %v", err)
+	}
+	defer consumer2.Close() // nolint:errcheck
+
+	time.Sleep(250 * time.Millisecond)
+
+	for i := 0; i < 4; i++ {
+		msg := mq.Message{Body: []byte(fmt.Sprintf("stream-msg-%d", i))}
+		if err := broker.Publish(ctx, "streams.route", msg); err != nil {
+			t.Fatalf("Publish stream-msg-%d: %v", i, err)
+		}
+	}
+
+	if err := broker.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+
+	receiveCtx, receiveCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer receiveCancel()
+
+	received := map[string]bool{}
+	for len(received) < 4 {
+		select {
+		case <-receiveCtx.Done():
+			t.Fatalf("timeout waiting for messages, received %d/4", len(received))
+		default:
+		}
+
+		for _, cons := range []mq.Consumer{consumer1, consumer2} {
+			delivery, err := cons.Receive(receiveCtx)
+			if err != nil {
+				continue
+			}
+			body := string(delivery.Message.Body)
+			if received[body] {
+				t.Fatalf("duplicate message: %s", body)
+			}
+			received[body] = true
+			if err := delivery.Ack(ctx); err != nil {
+				t.Fatalf("Ack %s: %v", body, err)
+			}
+			if len(received) == 4 {
+				break
+			}
+		}
+	}
+}
+
 func TestPublishModePushPull(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -315,6 +433,10 @@ func TestPublishModePushPull(t *testing.T) {
 		t.Fatalf("NewBroker: %v", err)
 	}
 	defer broker.Close(context.Background()) // nolint:errcheck
+
+	if err := broker.CreateQueue(ctx, "test.route", "pushpull-queue"); err != nil {
+		t.Fatalf("CreateQueue: %v", err)
+	}
 
 	// Publish two messages
 	msg1 := mq.Message{Body: []byte("message1")}
@@ -404,6 +526,10 @@ func TestPublishModePersistentPushPull(t *testing.T) {
 		t.Fatalf("NewBroker: %v", err)
 	}
 	defer broker.Close(context.Background()) // nolint:errcheck
+
+	if err := broker.CreateQueue(ctx, "test.route", "persistent-queue"); err != nil {
+		t.Fatalf("CreateQueue: %v", err)
+	}
 
 	msg := mq.Message{
 		Body: []byte("persistent pushpull message"),
@@ -608,15 +734,49 @@ func TestConsistencyPublishOptions(t *testing.T) {
 	}
 }
 
+func writeStreamPluginFile() (string, error) {
+	content := `[rabbitmq_federation,rabbitmq_management,rabbitmq_management_agent,rabbitmq_prometheus,rabbitmq_stream,rabbitmq_web_dispatch].` + "\n"
+	tmpFile, err := os.CreateTemp("", "enabled_plugins*.erl")
+	if err != nil {
+		return "", err
+	}
+	if _, err := tmpFile.WriteString(content); err != nil {
+		tmpFile.Close()
+		return "", err
+	}
+	if err := tmpFile.Close(); err != nil {
+		return "", err
+	}
+	return tmpFile.Name(), nil
+}
+
 func startRabbitMQ(ctx context.Context) (testcontainers.Container, error) {
 	req := testcontainers.ContainerRequest{
 		Image:        "rabbitmq:3.13-management",
-		ExposedPorts: []string{"5672/tcp"},
+		ExposedPorts: []string{"5672/tcp", "5552/tcp"},
 		WaitingFor:   wait.ForLog("Server startup complete"),
 	}
 
-	return testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+	pluginFile, err := writeStreamPluginFile()
+	if err != nil {
+		return nil, err
+	}
+	defer os.Remove(pluginFile)
+	req.Files = []testcontainers.ContainerFile{
+		{
+			HostFilePath:      pluginFile,
+			ContainerFilePath: "/etc/rabbitmq/enabled_plugins",
+			FileMode:          0o644,
+		},
+	}
+
+	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
 		ContainerRequest: req,
 		Started:          true,
 	})
+	if err != nil {
+		return nil, err
+	}
+
+	return container, nil
 }

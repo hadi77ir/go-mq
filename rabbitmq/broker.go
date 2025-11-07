@@ -7,16 +7,22 @@ import (
 	"net"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hadi77ir/go-mq"
 	amqp "github.com/rabbitmq/amqp091-go"
+	"github.com/rabbitmq/rabbitmq-stream-go-client/pkg/stream"
 )
 
 // Broker is a RabbitMQ implementation of the mq.Broker interface.
 type Broker struct {
 	cfg  Config
 	pool *mq.ConnectionPool[*amqp.Connection]
+
+	streamEnv       *stream.Environment
+	streamProducers sync.Map // map[string]*stream.SuperStreamProducer
+	streamDeclared  sync.Map // map[string]struct{}
 }
 
 // NewBroker creates a Broker backed by a connection pool.
@@ -26,52 +32,68 @@ func NewBroker(ctx context.Context, cfg Config) (*Broker, error) {
 		return nil, errors.Join(mq.ErrConfiguration, err)
 	}
 
-	factory := func(ctx context.Context) (*amqp.Connection, error) {
-		amqpCfg, err := buildAMQPConfig(cfg)
+	isStreamMode := cfg.PublishMode == PublishModeStreams
+
+	var pool *mq.ConnectionPool[*amqp.Connection]
+	var err error
+	if !isStreamMode {
+		factory := func(ctx context.Context) (*amqp.Connection, error) {
+			amqpCfg, err := buildAMQPConfig(cfg)
+			if err != nil {
+				return nil, errors.Join(mq.ErrConfiguration, err)
+			}
+
+			var lastErr error
+			for _, address := range cfg.Connection.Addresses {
+				select {
+				case <-ctx.Done():
+					return nil, errors.Join(mq.ErrNoConnection, ctx.Err())
+				default:
+				}
+
+				uri, err := buildAMQPURI(cfg.Connection, address)
+				if err != nil {
+					lastErr = errors.Join(mq.ErrConfiguration, err)
+					continue
+				}
+				conn, err := amqp.DialConfig(uri, *amqpCfg)
+				if err != nil {
+					lastErr = errors.Join(mq.ErrNoConnection, err)
+					continue
+				}
+				return conn, nil
+			}
+			if lastErr == nil {
+				lastErr = errors.Join(mq.ErrNoConnection, fmt.Errorf("rabbitmq: unable to connect"))
+			}
+			return nil, lastErr
+		}
+
+		pool, err = mq.NewConnectionPool(factory, mq.PoolOptions{
+			MaxSize:     cfg.MaxConnections,
+			IdleTimeout: cfg.IdleTimeout,
+		})
 		if err != nil {
 			return nil, errors.Join(mq.ErrConfiguration, err)
 		}
-
-		var lastErr error
-		for _, address := range cfg.Connection.Addresses {
-			select {
-			case <-ctx.Done():
-				return nil, errors.Join(mq.ErrNoConnection, ctx.Err())
-			default:
-			}
-
-			uri, err := buildAMQPURI(cfg.Connection, address)
-			if err != nil {
-				lastErr = errors.Join(mq.ErrConfiguration, err)
-				continue
-			}
-			conn, err := amqp.DialConfig(uri, *amqpCfg)
-			if err != nil {
-				lastErr = errors.Join(mq.ErrNoConnection, err)
-				continue
-			}
-			return conn, nil
-		}
-		if lastErr == nil {
-			lastErr = errors.Join(mq.ErrNoConnection, fmt.Errorf("rabbitmq: unable to connect"))
-		}
-		return nil, lastErr
 	}
 
-	pool, err := mq.NewConnectionPool(factory, mq.PoolOptions{
-		MaxSize:     cfg.MaxConnections,
-		IdleTimeout: cfg.IdleTimeout,
-	})
-	if err != nil {
-		return nil, errors.Join(mq.ErrConfiguration, err)
+	var streamEnv *stream.Environment
+	if isStreamMode {
+		streamEnv, err = newStreamEnvironment(cfg)
+		if err != nil {
+			return nil, errors.Join(mq.ErrConfiguration, err)
+		}
 	}
 
 	b := &Broker{
-		cfg:  cfg,
-		pool: pool,
+		cfg:            cfg,
+		pool:           pool,
+		streamEnv:      streamEnv,
+		streamDeclared: sync.Map{},
 	}
 
-	if cfg.DeclareExchange && cfg.Exchange != "" {
+	if !isStreamMode && cfg.DeclareExchange && cfg.Exchange != "" {
 		if err := b.ensureExchange(ctx); err != nil {
 			_ = pool.Close()
 			return nil, err
@@ -82,6 +104,9 @@ func NewBroker(ctx context.Context, cfg Config) (*Broker, error) {
 }
 
 func (b *Broker) ensureExchange(ctx context.Context) error {
+	if b.pool == nil {
+		return nil
+	}
 	conn, err := b.pool.Get(ctx)
 	if err != nil {
 		return errors.Join(mq.ErrNoConnection, err)
@@ -110,6 +135,10 @@ func (b *Broker) ensureExchange(ctx context.Context) error {
 
 // Publish sends a message to the configured exchange using the provided routing key.
 func (b *Broker) Publish(ctx context.Context, routingKey string, msg mq.Message, opts ...mq.Option) error {
+	if b.cfg.PublishMode == PublishModeStreams {
+		return b.publishStream(ctx, routingKey, msg, opts...)
+	}
+
 	conn, err := b.pool.Get(ctx)
 	if err != nil {
 		return errors.Join(mq.ErrNoConnection, err)
@@ -223,6 +252,10 @@ func (b *Broker) Publish(ctx context.Context, routingKey string, msg mq.Message,
 
 // Consume creates a consumer for the desired queue/binding.
 func (b *Broker) Consume(ctx context.Context, topic string, queue string, consumerName string, opts ...mq.Option) (mq.Consumer, error) {
+	if b.cfg.PublishMode == PublishModeStreams {
+		return b.consumeStream(ctx, topic, queue, consumerName, opts...)
+	}
+
 	conn, err := b.pool.Get(ctx)
 	if err != nil {
 		return nil, errors.Join(mq.ErrNoConnection, err)
@@ -343,6 +376,9 @@ func (b *Broker) Consume(ctx context.Context, topic string, queue string, consum
 
 // CreateQueue declares a queue and optionally binds it to the configured exchange.
 func (b *Broker) CreateQueue(ctx context.Context, topic, queue string) error {
+	if b.cfg.PublishMode == PublishModeStreams {
+		return b.createStream(topic)
+	}
 	conn, err := b.pool.Get(ctx)
 	if err != nil {
 		return errors.Join(mq.ErrNoConnection, err)
@@ -395,6 +431,9 @@ func (b *Broker) CreateQueue(ctx context.Context, topic, queue string) error {
 
 // DeleteQueue removes a queue and its bindings.
 func (b *Broker) DeleteQueue(ctx context.Context, _, queue string) error {
+	if b.cfg.PublishMode == PublishModeStreams {
+		return nil
+	}
 	conn, err := b.pool.Get(ctx)
 	if err != nil {
 		return errors.Join(mq.ErrNoConnection, err)
@@ -415,6 +454,9 @@ func (b *Broker) DeleteQueue(ctx context.Context, _, queue string) error {
 
 // Flush ensures all pending operations are completed by flushing the connection pool.
 func (b *Broker) Flush(ctx context.Context) error {
+	if b.cfg.PublishMode == PublishModeStreams {
+		return nil
+	}
 	conn, err := b.pool.Get(ctx)
 	if err != nil {
 		return errors.Join(mq.ErrNoConnection, err)
@@ -443,10 +485,24 @@ func (b *Broker) Flush(ctx context.Context) error {
 
 // Close releases all resources.
 func (b *Broker) Close(ctx context.Context) error {
-	if err := b.pool.Close(); err != nil {
-		return errors.Join(mq.ErrNoConnection, err)
+	var retErr error
+	if b.pool != nil {
+		if err := b.pool.Close(); err != nil {
+			retErr = errors.Join(mq.ErrNoConnection, err)
+		}
 	}
-	return nil
+	b.streamProducers.Range(func(key, value any) bool {
+		if producer, ok := value.(*stream.SuperStreamProducer); ok {
+			_ = producer.Close()
+		}
+		return true
+	})
+	if b.streamEnv != nil {
+		if err := b.streamEnv.Close(); err != nil && retErr == nil {
+			retErr = errors.Join(mq.ErrNoConnection, err)
+		}
+	}
+	return retErr
 }
 
 func generateConsumerTag() string {
