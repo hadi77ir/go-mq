@@ -157,6 +157,7 @@ Detailed documentation for each adapter:
 - [Valkey Adapter](docs/valkey.md) - Valkey Streams, Pub/Sub, and Lists
 - [Testing](docs/testing.md) - Testing strategies and examples
 - [Consistency](docs/consistency.md) - Cross-broker consistency guarantees
+- [Resilience](docs/resilience.md) - Retry and reconnection guidance
 
 ## Requirements
 
