@@ -16,6 +16,10 @@ A unified, broker-agnostic message queue library for Go that provides a consiste
 - **Dead Letter Queues**: Built-in support for dead letter topics/queues
 - **TLS Support**: Secure connections with configurable TLS settings
 
+## Thread Safety
+
+`mq.Broker` implementations are designed for concurrent use. Each adapter leverages the shared connection pool so that every `Publish`, `Consume`, or queue-management call borrows its own client connection/channel and releases it once finished. This means a single `Broker` instance can be reused across goroutines without external locking while remaining safe to close when those goroutines finish.
+
 ## Supported Brokers
 
 - **RabbitMQ** (`github.com/hadi77ir/go-mq/rabbitmq`) - AMQP-based messaging

@@ -6,6 +6,8 @@ The `github.com/hadi77ir/go-mq` module defines a broker-agnostic abstraction for
 - `github.com/hadi77ir/go-mq/valkey` uses the high-performance `valkey-go` client to provide Valkey Streams, Pub/Sub, and list-backed push/pull queues.
 - `github.com/hadi77ir/go-mq/nats` offers NATS core and JetStream implementations, including explicit ack workflows.
 
+All adapters share the same concurrency contract: a `Broker` can be reused safely across goroutines. Publish/consume operations borrow independent connections or channels from the pool and never mutate shared configuration, so no additional synchronization is required when sharing a broker instance across workers.
+
 ## Core Concepts
 
 | Type | Purpose |

@@ -148,6 +148,7 @@ type Publisher interface {
 }
 
 // Broker describes a client that supports a shared set of operations across message queue systems.
+// All Broker implementations provided by go-mq are safe for concurrent use by multiple goroutines.
 type Broker interface {
 	Publisher
 

@@ -27,6 +27,10 @@ type Config struct {
 - When `PublishModePubSub` is selected, messages are emitted via `PUBLISH`. Pub/Sub deliveries present acknowledgement functions that are safe no-ops.
 - Setting `PublishModeList` enables a classic push/pull queue built on `RPUSH`/`BRPOP`. Messages use CBOR-encoded envelopes (matching Pub/Sub) for efficient binary serialization. `Delivery.Nack(ctx, true)` requeues via `RPUSH`, while `Delivery.Nack(ctx, false)` forwards to `DeadLetterTopic` when provided.
 
+## Thread Safety
+
+`valkeymq.Broker` obtains a dedicated Valkey client connection from the shared pool for each publish/consume/queue call and returns it afterward. As a result you can share a single broker instance between multiple goroutines without introducing your own locks.
+
 ## Acknowledgements & Requeue
 
 Deliveries obtained from `Consume` expose `Ack` and `Nack` closures. `Nack(ctx, true)` removes the original pending entry and pushes an identical copy back onto the source stream. `Nack(ctx, false)` acks the original record and, when a dead-letter stream is configured, forwards the message there.

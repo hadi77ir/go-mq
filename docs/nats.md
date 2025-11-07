@@ -26,6 +26,10 @@ If `TLSConfig` is supplied it is used as-is, otherwise the adapter derives a `tl
 - `PublishModeCore` – plain NATS publish with queue subscribers. Ack/nack become no-ops.
 - `PublishModeJetStream` – messages land in a JetStream stream (declared automatically) and are consumed via durable pull subscribers with explicit `Ack`/`Nack` semantics.
 
+## Thread Safety
+
+`mqnats.Broker` shares the same concurrency guarantees as the other adapters. Operations borrow a `nats.Conn` wrapper from the connection pool, execute their work, and return it, so multiple goroutines can reuse a single broker safely. JetStream setup routines rely on the same pool and guard stream declaration work internally.
+
 ## Publishing
 
 `Broker.Publish` composes the final subject using `SubjectPrefix` and the supplied `target`. Common message metadata such as headers, content type, timestamps, correlation IDs, and reply addresses are attached using NATS headers.
