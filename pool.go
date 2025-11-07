@@ -137,6 +137,18 @@ func (p *ConnectionPool[T]) Release(conn T) error {
 	}
 }
 
+// ReleaseBroken removes a failed connection from the pool and closes it.
+func (p *ConnectionPool[T]) ReleaseBroken(conn T) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.total > 0 {
+		p.total--
+	}
+
+	return conn.Close()
+}
+
 // Close drains and closes the pool.
 func (p *ConnectionPool[T]) Close() error {
 	var closeErr error

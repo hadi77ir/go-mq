@@ -25,6 +25,21 @@ type Broker struct {
 	streamDeclared  sync.Map // map[string]struct{}
 }
 
+func (b *Broker) retry(ctx context.Context, op func(context.Context) error) error {
+	return mq.Retry(ctx, b.cfg.Retry, op)
+}
+
+func (b *Broker) releaseConnection(conn *amqp.Connection, broken bool) {
+	if b.pool == nil || conn == nil {
+		return
+	}
+	if broken {
+		_ = b.pool.ReleaseBroken(conn)
+		return
+	}
+	_ = b.pool.Release(conn)
+}
+
 // NewBroker creates a Broker backed by a connection pool.
 func NewBroker(ctx context.Context, cfg Config) (*Broker, error) {
 	cfg = cfg.normalized()
@@ -107,46 +122,62 @@ func (b *Broker) ensureExchange(ctx context.Context) error {
 	if b.pool == nil {
 		return nil
 	}
-	conn, err := b.pool.Get(ctx)
-	if err != nil {
-		return errors.Join(mq.ErrNoConnection, err)
-	}
-	defer b.pool.Release(conn) // nolint:errcheck
+	return b.retry(ctx, func(ctx context.Context) error {
+		conn, err := b.pool.Get(ctx)
+		if err != nil {
+			return errors.Join(mq.ErrNoConnection, err)
+		}
+		broken := false
+		defer b.releaseConnection(conn, broken)
 
-	ch, err := conn.Channel()
-	if err != nil {
-		return errors.Join(mq.ErrNoConnection, err)
-	}
-	defer ch.Close() // nolint:errcheck
+		ch, err := conn.Channel()
+		if err != nil {
+			broken = true
+			return errors.Join(mq.ErrNoConnection, err)
+		}
+		defer ch.Close() // nolint:errcheck
 
-	if err := ch.ExchangeDeclare(
-		b.cfg.Exchange,
-		b.cfg.ExchangeType,
-		true,
-		false,
-		false,
-		false,
-		nil,
-	); err != nil {
-		return errors.Join(mq.ErrConfiguration, err)
-	}
-	return nil
+		if err := ch.ExchangeDeclare(
+			b.cfg.Exchange,
+			b.cfg.ExchangeType,
+			true,
+			false,
+			false,
+			false,
+			nil,
+		); err != nil {
+			if isAMQPConnectionError(err) {
+				broken = true
+			}
+			return errors.Join(mq.ErrConfiguration, err)
+		}
+		return nil
+	})
 }
 
 // Publish sends a message to the configured exchange using the provided routing key.
 func (b *Broker) Publish(ctx context.Context, routingKey string, msg mq.Message, opts ...mq.Option) error {
 	if b.cfg.PublishMode == PublishModeStreams {
-		return b.publishStream(ctx, routingKey, msg, opts...)
+		return b.retry(ctx, func(ctx context.Context) error {
+			return b.publishStream(ctx, routingKey, msg, opts...)
+		})
 	}
+	return b.retry(ctx, func(ctx context.Context) error {
+		return b.publishAMQP(ctx, routingKey, msg, opts...)
+	})
+}
 
+func (b *Broker) publishAMQP(ctx context.Context, routingKey string, msg mq.Message, opts ...mq.Option) error {
 	conn, err := b.pool.Get(ctx)
 	if err != nil {
 		return errors.Join(mq.ErrNoConnection, err)
 	}
-	defer b.pool.Release(conn) // nolint:errcheck
+	broken := false
+	defer b.releaseConnection(conn, broken)
 
 	ch, err := conn.Channel()
 	if err != nil {
+		broken = true
 		return errors.Join(mq.ErrNoConnection, err)
 	}
 	defer ch.Close() // nolint:errcheck
@@ -245,6 +276,9 @@ func (b *Broker) Publish(ctx context.Context, routingKey string, msg mq.Message,
 		false,
 		publishing,
 	); err != nil {
+		if isAMQPConnectionError(err) {
+			broken = true
+		}
 		return errors.Join(mq.ErrPublishFailed, err)
 	}
 	return nil
@@ -253,17 +287,45 @@ func (b *Broker) Publish(ctx context.Context, routingKey string, msg mq.Message,
 // Consume creates a consumer for the desired queue/binding.
 func (b *Broker) Consume(ctx context.Context, topic string, queue string, consumerName string, opts ...mq.Option) (mq.Consumer, error) {
 	if b.cfg.PublishMode == PublishModeStreams {
-		return b.consumeStream(ctx, topic, queue, consumerName, opts...)
+		var streamConsumer mq.Consumer
+		err := b.retry(ctx, func(ctx context.Context) error {
+			cons, err := b.consumeStream(ctx, topic, queue, consumerName, opts...)
+			if err == nil {
+				streamConsumer = cons
+			}
+			return err
+		})
+		if err != nil {
+			return nil, err
+		}
+		return streamConsumer, nil
 	}
 
+	var consumer mq.Consumer
+	err := b.retry(ctx, func(ctx context.Context) error {
+		cons, err := b.consumeAMQP(ctx, topic, queue, consumerName, opts...)
+		if err == nil {
+			consumer = cons
+		}
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return consumer, nil
+}
+
+func (b *Broker) consumeAMQP(ctx context.Context, topic, queue, consumerName string, opts ...mq.Option) (mq.Consumer, error) {
 	conn, err := b.pool.Get(ctx)
 	if err != nil {
 		return nil, errors.Join(mq.ErrNoConnection, err)
 	}
+	broken := false
 
 	ch, err := conn.Channel()
 	if err != nil {
-		_ = b.pool.Release(conn)
+		broken = true
+		b.releaseConnection(conn, broken)
 		return nil, errors.Join(mq.ErrNoConnection, err)
 	}
 
@@ -287,8 +349,11 @@ func (b *Broker) Consume(ctx context.Context, topic string, queue string, consum
 	}
 	if prefetch > 0 {
 		if err := ch.Qos(prefetch, 0, false); err != nil {
-			ch.Close()           // nolint:errcheck
-			b.pool.Release(conn) // nolint:errcheck
+			if isAMQPConnectionError(err) {
+				broken = true
+			}
+			ch.Close() // nolint:errcheck
+			b.releaseConnection(conn, broken)
 			return nil, errors.Join(mq.ErrConsumeFailed, err)
 		}
 	}
@@ -300,15 +365,14 @@ func (b *Broker) Consume(ctx context.Context, topic string, queue string, consum
 	queueName := queue
 	if queueName == "" {
 		if isPubSub {
-			// For pub-sub, generate a unique queue name per consumer
 			queueName = fmt.Sprintf("pubsub-%s-%d", topic, time.Now().UnixNano())
 		} else {
 			queueName = topic
 		}
 	}
 	if queueName == "" {
-		ch.Close()           // nolint:errcheck
-		b.pool.Release(conn) // nolint:errcheck
+		ch.Close() // nolint:errcheck
+		b.releaseConnection(conn, broken)
 		return nil, errors.Join(mq.ErrConfiguration, fmt.Errorf("rabbitmq: queue or topic must be provided"))
 	}
 
@@ -317,8 +381,6 @@ func (b *Broker) Consume(ctx context.Context, topic string, queue string, consum
 		queueArgs["x-dead-letter-exchange"] = deadLetterTopic
 	}
 
-	// For pub-sub modes: auto-delete queues (temporary for non-persistent, durable for persistent)
-	// For push-pull modes: regular queues with durability based on mode
 	queueDurable := isPersistent
 	queueAutoDelete := isPubSub && !isPersistent
 	queueExclusive := isPubSub && !isPersistent
@@ -332,21 +394,25 @@ func (b *Broker) Consume(ctx context.Context, topic string, queue string, consum
 		queueArgs,
 	)
 	if err != nil {
-		ch.Close()           // nolint:errcheck
-		b.pool.Release(conn) // nolint:errcheck
+		if isAMQPConnectionError(err) {
+			broken = true
+		}
+		ch.Close() // nolint:errcheck
+		b.releaseConnection(conn, broken)
 		return nil, errors.Join(mq.ErrConsumeFailed, err)
 	}
 
-	// For pub-sub modes with fanout exchange, routing key is ignored
-	// For push-pull modes, bind with the topic as routing key
 	if b.cfg.Exchange != "" {
 		routingKey := topic
 		if isPubSub && b.cfg.ExchangeType == "fanout" {
-			routingKey = "" // Fanout exchanges ignore routing keys
+			routingKey = ""
 		}
 		if err := ch.QueueBind(queueName, routingKey, b.cfg.Exchange, false, nil); err != nil {
-			ch.Close()           // nolint:errcheck
-			b.pool.Release(conn) // nolint:errcheck
+			if isAMQPConnectionError(err) {
+				broken = true
+			}
+			ch.Close() // nolint:errcheck
+			b.releaseConnection(conn, broken)
 			return nil, errors.Join(mq.ErrConsumeFailed, err)
 		}
 	}
@@ -366,8 +432,11 @@ func (b *Broker) Consume(ctx context.Context, topic string, queue string, consum
 		nil,
 	)
 	if err != nil {
-		ch.Close()           // nolint:errcheck
-		b.pool.Release(conn) // nolint:errcheck
+		if isAMQPConnectionError(err) {
+			broken = true
+		}
+		ch.Close() // nolint:errcheck
+		b.releaseConnection(conn, broken)
 		return nil, errors.Join(mq.ErrConsumeFailed, err)
 	}
 
@@ -377,16 +446,26 @@ func (b *Broker) Consume(ctx context.Context, topic string, queue string, consum
 // CreateQueue declares a queue and optionally binds it to the configured exchange.
 func (b *Broker) CreateQueue(ctx context.Context, topic, queue string) error {
 	if b.cfg.PublishMode == PublishModeStreams {
-		return b.createStream(topic)
+		return b.retry(ctx, func(ctx context.Context) error {
+			return b.createStream(topic)
+		})
 	}
+	return b.retry(ctx, func(ctx context.Context) error {
+		return b.createQueueAMQP(ctx, topic, queue)
+	})
+}
+
+func (b *Broker) createQueueAMQP(ctx context.Context, topic, queue string) error {
 	conn, err := b.pool.Get(ctx)
 	if err != nil {
 		return errors.Join(mq.ErrNoConnection, err)
 	}
-	defer b.pool.Release(conn) // nolint:errcheck
+	broken := false
+	defer b.releaseConnection(conn, broken)
 
 	ch, err := conn.Channel()
 	if err != nil {
+		broken = true
 		return errors.Join(mq.ErrNoConnection, err)
 	}
 	defer ch.Close() // nolint:errcheck
@@ -422,6 +501,9 @@ func (b *Broker) CreateQueue(ctx context.Context, topic, queue string) error {
 			routingKey = "" // Fanout exchanges ignore routing keys
 		}
 		if err := ch.QueueBind(queue, routingKey, b.cfg.Exchange, false, nil); err != nil {
+			if isAMQPConnectionError(err) {
+				broken = true
+			}
 			return errors.Join(mq.ErrConfiguration, err)
 		}
 	}
@@ -434,22 +516,29 @@ func (b *Broker) DeleteQueue(ctx context.Context, _, queue string) error {
 	if b.cfg.PublishMode == PublishModeStreams {
 		return nil
 	}
-	conn, err := b.pool.Get(ctx)
-	if err != nil {
-		return errors.Join(mq.ErrNoConnection, err)
-	}
-	defer b.pool.Release(conn) // nolint:errcheck
+	return b.retry(ctx, func(ctx context.Context) error {
+		conn, err := b.pool.Get(ctx)
+		if err != nil {
+			return errors.Join(mq.ErrNoConnection, err)
+		}
+		broken := false
+		defer b.releaseConnection(conn, broken)
 
-	ch, err := conn.Channel()
-	if err != nil {
-		return errors.Join(mq.ErrNoConnection, err)
-	}
-	defer ch.Close() // nolint:errcheck
+		ch, err := conn.Channel()
+		if err != nil {
+			broken = true
+			return errors.Join(mq.ErrNoConnection, err)
+		}
+		defer ch.Close() // nolint:errcheck
 
-	if _, err := ch.QueueDelete(queue, false, false, false); err != nil {
-		return errors.Join(mq.ErrConfiguration, err)
-	}
-	return nil
+		if _, err := ch.QueueDelete(queue, false, false, false); err != nil {
+			if isAMQPConnectionError(err) {
+				broken = true
+			}
+			return errors.Join(mq.ErrConfiguration, err)
+		}
+		return nil
+	})
 }
 
 // Flush ensures all pending operations are completed by flushing the connection pool.
@@ -457,30 +546,36 @@ func (b *Broker) Flush(ctx context.Context) error {
 	if b.cfg.PublishMode == PublishModeStreams {
 		return nil
 	}
-	conn, err := b.pool.Get(ctx)
-	if err != nil {
-		return errors.Join(mq.ErrNoConnection, err)
-	}
-	defer b.pool.Release(conn) // nolint:errcheck
+	return b.retry(ctx, func(ctx context.Context) error {
+		conn, err := b.pool.Get(ctx)
+		if err != nil {
+			return errors.Join(mq.ErrNoConnection, err)
+		}
+		broken := false
+		defer b.releaseConnection(conn, broken)
 
-	ch, err := conn.Channel()
-	if err != nil {
-		return errors.Join(mq.ErrNoConnection, err)
-	}
-	defer ch.Close() // nolint:errcheck
+		ch, err := conn.Channel()
+		if err != nil {
+			broken = true
+			return errors.Join(mq.ErrNoConnection, err)
+		}
+		defer ch.Close() // nolint:errcheck
 
-	// AMQP channels don't have a direct flush, but we can ensure the channel is ready
-	// by checking if we can declare a temporary queue and delete it
-	tempQueue := fmt.Sprintf("__flush__%d", time.Now().UnixNano())
-	_, err = ch.QueueDeclare(tempQueue, false, true, true, false, nil)
-	if err != nil {
-		return errors.Join(mq.ErrNoConnection, err)
-	}
-	_, err = ch.QueueDelete(tempQueue, false, false, false)
-	if err != nil {
-		return errors.Join(mq.ErrNoConnection, err)
-	}
-	return nil
+		tempQueue := fmt.Sprintf("__flush__%d", time.Now().UnixNano())
+		if _, err = ch.QueueDeclare(tempQueue, false, true, true, false, nil); err != nil {
+			if isAMQPConnectionError(err) {
+				broken = true
+			}
+			return errors.Join(mq.ErrNoConnection, err)
+		}
+		if _, err = ch.QueueDelete(tempQueue, false, false, false); err != nil {
+			if isAMQPConnectionError(err) {
+				broken = true
+			}
+			return errors.Join(mq.ErrNoConnection, err)
+		}
+		return nil
+	})
 }
 
 // Close releases all resources.
@@ -507,6 +602,24 @@ func (b *Broker) Close(ctx context.Context) error {
 
 func generateConsumerTag() string {
 	return fmt.Sprintf("go-mq-%d", time.Now().UnixNano())
+}
+
+func isAMQPConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, amqp.ErrClosed) {
+		return true
+	}
+	var amqpErr *amqp.Error
+	if errors.As(err, &amqpErr) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	return false
 }
 func buildAMQPURI(cfg mq.Config, address string) (string, error) {
 	scheme := "amqp"

@@ -1,96 +1,45 @@
 # Resilience, Retries, and Reconnection
 
-`go-mq` deliberately fails fast when the underlying transport becomes unavailable. Each broker call borrows a connection from the shared pool, performs the requested operation, and releases the connection. The pool itself does **not** attempt transparent reconnections or automatic retries—this keeps the core focused on deterministic behaviour and leaves resiliency trade-offs to the application.
+`go-mq` automatically retries broker operations with an exponential backoff policy (`mq.RetryPolicy`). RabbitMQ adapters proactively discard broken channels/connections so each retry dials a fresh connection and replays the required declarations. RabbitMQ super-stream producers are recreated transparently when the underlying TCP link drops. This keeps publish and consume setup calls resilient by default while allowing applications to bound retries through configuration.
 
-This document describes what happens when a connection is lost and how to add retries and restarts around the provided brokers.
+## Default Behaviour
 
-## Connection Lifecycle
+- Every `Publish`, `Consume`, `CreateQueue`, `DeleteQueue`, and `Flush` call uses the adapter's `Retry` policy. The default policy retries indefinitely (bounded by the request context) with exponential backoff starting at 200 ms and capped at 5 s.
+- RabbitMQ (AMQP modes) validates the connection on every retry. Whenever an operation encounters `amqp.ErrClosed`, network errors, or channel/connection shutdowns, the pool entry is discarded and a new TCP connection is created for the next attempt.
+- RabbitMQ Streams recreate `SuperStreamProducer` instances the moment a send fails, so the next retry goes through a fresh producer.
+- Operations that fail with `mq.ErrConfiguration` or `mq.ErrNotSupported` return immediately; these are considered permanent errors.
 
-- **Publish / queue APIs**: Each call obtains a connection (or stream client), opens the necessary channel, performs the operation, and immediately releases the resources. If the connection has been severed, the call returns one of the standard errors (`mq.ErrNoConnection`, `mq.ErrPublishFailed`, `mq.ErrConfiguration`, etc.).
-- **Consumers**: A consumer owns a single connection (or stream client) for its entire lifetime. Once the underlying connection drops, `Receive` eventually returns `mq.ErrConsumeFailed` (wrapping the transport error) and the consumer cannot recover. The caller must close it and build a new consumer.
-- **Connection pool**: The pool only creates new connections when asked for one and less than `MaxSize` are currently open. It does not monitor health; a dead connection that is returned to the pool is reused until it is explicitly closed or evicted by `IdleTimeout`. When repeated `mq.ErrNoConnection` errors are observed, close the broker so the pool drains and rebuild it.
+Because retries are tied to the call's context, you can keep the default infinite attempts for best effort delivery and rely on context deadlines/timeouts to bound latency.
 
-Because of this design, retries and restarts should happen in user code.
+## Customising the Retry Policy
 
-## Retrying Publish Calls
-
-Wrap publish operations in a loop that retries on transient errors (`mq.ErrNoConnection`, `mq.ErrPublishFailed`, context cancellations, etc.). Use a bounded backoff to avoid overwhelming the broker.
+Each adapter exposes a `Retry mq.RetryPolicy` field on its `Config`. Adjust it to cap attempts or tune delays:
 
 ```go
-func publishWithRetry(ctx context.Context, broker mq.Broker, topic string, msg mq.Message) error {
-	backoff := time.Millisecond * 200
-	for attempts := 0; attempts < 5; attempts++ {
-		if err := broker.Publish(ctx, topic, msg); err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return err
-			}
-			time.Sleep(backoff)
-			backoff *= 2
-			continue
-		}
-		return nil
-	}
-	return fmt.Errorf("publish retries exhausted")
+cfg := rabbitmq.Config{
+    Retry: mq.RetryPolicy{
+        MaxAttempts:    6,
+        InitialBackoff: 250 * time.Millisecond,
+        MaxBackoff:     3 * time.Second,
+        Multiplier:     2,
+    },
+    // ...
 }
 ```
 
-When retries keep failing with `mq.ErrNoConnection`, close the broker and recreate it to force the pool to re-dial:
+- `MaxAttempts <= 0` means infinite retries.
+- `InitialBackoff`, `MaxBackoff`, and `Multiplier` control the exponential curve.
 
-```go
-broker.Close(ctx)              // ignore error
-broker, _ = rabbitmq.NewBroker(ctx, cfg)
-```
+The helper `mq.Retry(ctx, policy, func(ctx context.Context) error)` is exported so applications can reuse the same policy for higher-level workflows (for example, wrapping business logic that calls multiple brokers).
 
-## Restarting Consumers After Disconnects
+## Consumers
 
-Consumers must be recreated when `Receive` fails. A common pattern is to run each logical consumer inside a loop that recreates both the broker consumer and the goroutine reading from it.
+`Broker.Consume` now retries the subscription setup (queue declarations, QoS, bindings, stream consumer creation) using the configured policy. When the call returns a consumer, it owns a healthy connection/channel. If the connection later drops, `Receive` still returns `mq.ErrConsumeFailed`; callers should close the consumer and create a new one, which will once again benefit from the retry policy during setup.
 
-```go
-func consumeForever(ctx context.Context, broker mq.Broker, topic, queue string) {
-	for ctx.Err() == nil {
-		consumer, err := broker.Consume(ctx, topic, queue, "")
-		if err != nil {
-			time.Sleep(time.Second)
-			continue
-		}
-		for ctx.Err() == nil {
-			msg, err := consumer.Receive(ctx)
-			if err != nil {
-				consumer.Close() // nolint:errcheck
-				break
-			}
-			process(msg)
-			_ = msg.Ack(ctx)
-		}
-	}
-}
-```
+## Adapter Notes
 
-If the broker itself errors repeatedly during consumer creation (`mq.ErrNoConnection`), recreate the broker as described above.
+- **RabbitMQ (AMQP)** – Connections that fail mid-operation are removed from the pool, ensuring the next retry dials a fresh socket before redeclaring queues/bindings.
+- **RabbitMQ Streams** – Any producer failure results in the cached producer being discarded and lazily recreated on the next retry.
+- **NATS / Valkey** – These adapters rely on their respective client libraries for reconnection. Planned work will extend the shared retry policy to their operations for full parity.
 
-## Adapter-Specific Notes
-
-### RabbitMQ (AMQP modes)
-
-- `amqp091-go` connections do not reconnect automatically once the TCP socket is closed.
-- When a call returns `mq.ErrNoConnection` or `mq.ErrPublishFailed`, retry the publish. If the error persists, close the broker so the pool drops the dead connections and build a new broker.
-- Consumers exit when their channel or connection closes. Wrap them in a restart loop as shown earlier.
-
-### RabbitMQ Streams
-
-- `rabbitmq-stream-go-client` internally reconnects individual partitions, but `go-mq` still reports `mq.ErrPublishFailed` when the client cannot recover. Retry publishes; if the environment has been torn down, close and recreate the broker (which recreates the stream environment and producers).
-
-### NATS
-
-- `nats.Conn` has built-in reconnect logic. During reconnect attempts publish calls return errors from `conn.PublishMsg`/`JetStream.PublishMsg`, so retries are still required.
-- JetStream pull consumers (`Fetch`) return errors when the subscription is drained during reconnect. Close the consumer and recreate it; JetStream will resume from the durable cursor.
-- You can customise reconnect wait/limits by wrapping `nats.Options` before constructing the broker.
-
-### Valkey
-
-- `valkey-go` reconnects sockets internally, but long outages will surface as errors from `Client.Do`. When `Receive` or `Publish` returns a `mq.Err*` error, retry; if every attempt fails, rebuild the broker to reinitialise the client.
-- Consumers exit on `XREADGROUP` failures and must be recreated.
-
-## Summary
-
-The current implementations report transport failures back to the caller rather than hiding them. Implement retries with exponential backoff around publish operations, restart consumers when `Receive` fails, and recreate brokers when the connection pool appears to be full of dead connections. This keeps failure handling explicit and lets each application decide how aggressive it should be when recovering from outages.
+Use the `Retry` policy together with context deadlines to achieve the resilience profile you need without sprinkling manual retry loops throughout your codebase.

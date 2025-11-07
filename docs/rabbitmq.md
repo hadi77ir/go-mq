@@ -17,6 +17,7 @@ type Config struct {
     IdleTimeout       time.Duration // idle connection eviction window
     PublishMode       PublishMode   // Push/Pull, Pub/Sub, or Streams (defaults to persistent push-pull)
     Stream            StreamConfig  // retention controls when PublishModeStreams is selected
+    Retry             mq.RetryPolicy // exponential backoff for publish/consume retries
 }
 
 type StreamConfig struct {
@@ -34,9 +35,11 @@ type StreamConfig struct {
 
 The shared `mq.Config` embedded in `Connection` supplies addresses, credentials, and optional TLS information. The adapter dials each address in order until a connection succeeds. TLS can be provided either through `TLSConfig` or the legacy `UseTLS`/certificate path fields.
 
-## Thread Safety
+## Thread Safety & Resilience
 
 `rabbitmq.Broker` instances are safe for concurrent publishing or queue management. Each call acquires a connection from the shared pool, opens a dedicated AMQP channel, and releases the resources once complete. Streams mode also multiplexes a pool of producers via `sync.Map`, so you can share a single broker across goroutines without extra locking.
+
+All operations use the shared `Retry` policy (default: unlimited attempts with exponential backoff starting at 200 ms) so transient failures trigger automatic reconnection and re-declaration attempts. Tune `Config.Retry` if you need to cap attempts or adjust the backoff curve.
 
 ## Publishing
 

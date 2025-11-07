@@ -15,10 +15,11 @@ A unified, broker-agnostic message queue library for Go that provides a consiste
 - **Explicit Acknowledgments**: Full control over message acknowledgment and negative acknowledgment
 - **Dead Letter Queues**: Built-in support for dead letter topics/queues
 - **TLS Support**: Secure connections with configurable TLS settings
+- **Resilient Operations**: Exponential backoff with automatic RabbitMQ reconnection for publish/consume paths
 
 ## Thread Safety
 
-`mq.Broker` implementations are designed for concurrent use. Each adapter leverages the shared connection pool so that every `Publish`, `Consume`, or queue-management call borrows its own client connection/channel and releases it once finished. This means a single `Broker` instance can be reused across goroutines without external locking while remaining safe to close when those goroutines finish.
+`mq.Broker` implementations are designed for concurrent use. Each adapter leverages the shared connection pool so that every `Publish`, `Consume`, or queue-management call borrows its own client connection/channel and releases it once finished. This means a single `Broker` instance can be reused across goroutines without external locking while remaining safe to close when those goroutines finish. Combined with the new `mq.RetryPolicy`, brokers can continuously retry transient failures while allowing callers to cap attempts or tune backoff windows.
 
 ## Supported Brokers
 

@@ -75,6 +75,9 @@ type Config struct {
 
 	// Stream configures RabbitMQ stream queues when PublishModeStreams is selected.
 	Stream StreamConfig
+
+	// Retry defines the exponential backoff policy for publish/consume operations.
+	Retry mq.RetryPolicy
 }
 
 func (c Config) normalized() Config {
@@ -108,6 +111,7 @@ func (c Config) normalized() Config {
 	if c.Stream.MaxConsumersPerClient <= 0 {
 		c.Stream.MaxConsumersPerClient = 1
 	}
+	c.Retry = c.Retry.Normalized()
 	return c
 }
 

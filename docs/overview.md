@@ -16,6 +16,7 @@ All adapters share the same concurrency contract: a `Broker` can be reused safel
 | `mq.Broker` | Unified broker contract providing publish, consume, queue lifecycle and shutdown operations. |
 | `mq.Message` / `mq.Delivery` | Portable payload and delivery metadata including acknowledgement hooks. |
 | `mq.ConnectionPool` | Generic pool intended for long-lived broker connections. Implementations reuse it for connection re-use and throttling. |
+| `mq.RetryPolicy` | Exponential backoff parameters applied to publish/consume operations for resilience. |
 
 Each adapter exposes an implementation-specific `Config` struct that embeds `mq.Config` and adds transport specific knobs (prefetch, exchanges, stream trimming, etc.). Consumer options capture routing, queue, batching and dead-letter behaviour in a transport-agnostic way.
 

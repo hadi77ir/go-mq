@@ -46,6 +46,7 @@ func (b *Broker) publishStream(ctx context.Context, streamName string, msg mq.Me
 	}
 
 	if err := producer.Send(streamMsg); err != nil {
+		b.streamProducers.Delete(streamName)
 		return errors.Join(mq.ErrPublishFailed, err)
 	}
 	return nil
