@@ -4,7 +4,7 @@ go 1.24.0
 
 require (
 	github.com/docker/go-connections v0.6.0
-	github.com/hadi77ir/go-mq v1.1.0
+	github.com/hadi77ir/go-mq v1.3.0
 	github.com/hadi77ir/go-mq/nats v0.0.0
 	github.com/hadi77ir/go-mq/rabbitmq v0.0.0
 	github.com/hadi77ir/go-mq/valkey v0.0.0
